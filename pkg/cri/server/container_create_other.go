@@ -56,7 +56,26 @@ func (c *criService) containerSpecOpts(config *runtime.ContainerConfig, imageCon
 	return []oci.SpecOpts{}, nil
 }
 
-// snapshotterOpts returns snapshotter options for the rootfs snapshot
+// use SEALOS_DEVBOX_UID to set the uid of the container
+// we don't use pod annotations or labels because it will cause circular dependency
+const devboxUidEnvKey = "SEALOS_DEVBOX_UID"
+
+// snapshotterOpts returns any Linux specific snapshotter options for the rootfs snapshot
 func snapshotterOpts(snapshotterName string, config *runtime.ContainerConfig) ([]snapshots.Opt, error) {
-	return []snapshots.Opt{}, nil
+	nsOpts := config.GetLinux().GetSecurityContext().GetNamespaceOptions()
+	snapshotOpts, err := snapshotterRemapOpts(nsOpts)
+	if err != nil {
+		return nil, err
+	}
+	for _, env := range config.Envs {
+		if env.Key == devboxUidEnvKey {
+			if env.Value == "" {
+				return snapshotOpts, nil
+			}
+			snapshotOpts = append(snapshotOpts, snapshots.WithLabels(map[string]string{
+				"devbox.sealos.io/uid": env.Value,
+			}))
+		}
+	}
+	return snapshotOpts, nil
 }
