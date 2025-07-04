@@ -63,7 +63,7 @@ func NewOverlayfsDiff(store content.Store) diff.Comparer {
 // Compare creates a diff between the given mounts and uploads the result
 // to the content store.
 func (s *overlayfsDiff) Compare(ctx context.Context, lower, upper []mount.Mount, opts ...diff.Opt) (d ocispec.Descriptor, err error) {
-	layer, err := overlayMountsToLayer(lower)
+	layer, err := overlayMountsToLayer(upper)
 	if err != nil {
 		return emptyDesc, fmt.Errorf("failed to get overlay layer: %w", err)
 	}
@@ -77,24 +77,21 @@ func (s *overlayfsDiff) Compare(ctx context.Context, lower, upper []mount.Mount,
 		config.SourceDateEpoch = tm
 	}
 
-	var isCompressed bool
-	if config.Compressor != nil {
-		if config.MediaType == "" {
-			return emptyDesc, errors.New("media type must be explicitly specified when using custom compressor")
-		}
-		isCompressed = true
-	} else {
-		if config.MediaType == "" {
-			config.MediaType = ocispec.MediaTypeImageLayerGzip
-		}
+	// if config.MediaType is not set, we default to gzip compressed layer
+	if config.MediaType == "" {
+		config.MediaType = ocispec.MediaTypeImageLayerGzip
+	}
 
-		switch config.MediaType {
-		case ocispec.MediaTypeImageLayer:
-		case ocispec.MediaTypeImageLayerGzip:
-			isCompressed = true
-		default:
-			return emptyDesc, fmt.Errorf("unsupported diff media type: %v: %w", config.MediaType, errdefs.ErrNotImplemented)
-		}
+	var compressionType compression.Compression
+	switch config.MediaType {
+	case ocispec.MediaTypeImageLayer:
+		compressionType = compression.Uncompressed
+	case ocispec.MediaTypeImageLayerGzip:
+		compressionType = compression.Gzip
+	case ocispec.MediaTypeImageLayerZstd:
+		compressionType = compression.Zstd
+	default:
+		return emptyDesc, fmt.Errorf("unsupported diff media type: %v: %w", config.MediaType, errdefs.ErrNotImplemented)
 	}
 
 	for i, mount := range lower {
@@ -147,7 +144,7 @@ func (s *overlayfsDiff) Compare(ctx context.Context, lower, upper []mount.Mount,
 
 	upperRoot := filepath.Join(layer, "fs")
 
-	if isCompressed {
+	if compressionType != compression.Uncompressed {
 		dgstr := digest.SHA256.Digester()
 		var compressed io.WriteCloser
 		if config.Compressor != nil {
@@ -156,12 +153,12 @@ func (s *overlayfsDiff) Compare(ctx context.Context, lower, upper []mount.Mount,
 				return emptyDesc, fmt.Errorf("failed to get compressed stream: %w", errOpen)
 			}
 		} else {
-			compressed, errOpen = compression.CompressStream(cw, compression.Gzip)
+			compressed, errOpen = compression.CompressStream(cw, compressionType)
 			if errOpen != nil {
 				return emptyDesc, fmt.Errorf("failed to get compressed stream: %w", errOpen)
 			}
 		}
-		errOpen = writeDiff(ctx, io.MultiWriter(compressed, dgstr.Hash()), lower, upperRoot)
+		errOpen = writeDiff(ctx, io.MultiWriter(compressed, dgstr.Hash()), lower, upperRoot, config.SourceDateEpoch)
 		compressed.Close()
 		if errOpen != nil {
 			return emptyDesc, fmt.Errorf("failed to write compressed diff: %w", errOpen)
@@ -172,7 +169,7 @@ func (s *overlayfsDiff) Compare(ctx context.Context, lower, upper []mount.Mount,
 		}
 		config.Labels[labels.LabelUncompressed] = dgstr.Digest().String()
 	} else {
-		err := writeDiff(ctx, cw, lower, upperRoot)
+		err := writeDiff(ctx, cw, lower, upperRoot, config.SourceDateEpoch)
 		if err != nil {
 			return emptyDesc, fmt.Errorf("failed to write diff: %w", err)
 		}
@@ -223,14 +220,16 @@ func uniqueRef() string {
 	return fmt.Sprintf("%d-%s", t.UnixNano(), base64.URLEncoding.EncodeToString(b[:]))
 }
 
-func writeDiff(ctx context.Context, w io.Writer, lower []mount.Mount, upperRoot string) error {
+func writeDiff(ctx context.Context, w io.Writer, lower []mount.Mount, upperRoot string, sourceDateEpoch *time.Time) error {
 	var opts []archive.ChangeWriterOpt
+	if sourceDateEpoch != nil {
+		opts = append(opts, archive.WithModTimeUpperBound(*sourceDateEpoch))
+	}
 
 	return mount.WithTempMount(ctx, lower, func(lowerRoot string) error {
 		cw := archive.NewChangeWriter(w, upperRoot, opts...)
-		err := fs.DiffDirChanges(ctx, lowerRoot, upperRoot, fs.DiffSourceOverlayFS, cw.HandleChange)
-		if err != nil {
-			return fmt.Errorf("failed to create diff tar stream: %w", err)
+		if err := fs.DiffDirChanges(ctx, lowerRoot, upperRoot, fs.DiffSourceOverlayFS, cw.HandleChange); err != nil {
+			return fmt.Errorf("failed to calculate diff changes: %w", err)
 		}
 		return cw.Close()
 	})
